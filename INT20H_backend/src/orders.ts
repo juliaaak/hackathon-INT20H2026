@@ -71,13 +71,13 @@ router.post("/", async (req: Request, res: Response) => {
   const id = runQuery(
     `INSERT INTO orders (id, latitude, longitude, subtotal, timestamp, zip_code, state, tax_region,
       county_fips, state_rate, county_rate, city_rate, special_rate, composite_tax_rate,
-      tax_amount, total_amount, jurisdictions)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      tax_amount, total_amount, jurisdictions, import_session_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [newId, lat, lon, sub, ts, tax.zip_code, tax.state, tax.tax_region,
      tax.county_fips,
      tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
      tax.composite_tax_rate, tax.tax_amount, tax.total_amount,
-     JSON.stringify(tax.jurisdictions)]
+     JSON.stringify(tax.jurisdictions), null]
   );
 
   const order = queryOne("SELECT * FROM orders WHERE id = ?", [id]);
@@ -113,8 +113,10 @@ router.post("/import/stream", upload.single("file"), async (req: Request, res: R
   let cancelRequested = false;
   const BATCH_SIZE = 5;
 
-  // Register cancel function so POST /orders/import/cancel can trigger it
+  // Generate unique session ID for this import
   const sessionId = `${Date.now()}-${Math.random()}`;
+
+  // Register cancel function so POST /orders/import/cancel can trigger it
   importSessions.set(sessionId, () => { cancelRequested = true; });
   send({ type: "session", sessionId });
 
@@ -146,15 +148,34 @@ router.post("/import/stream", upload.single("file"), async (req: Request, res: R
         failed.push({ original_id: row.id, error: result.reason?.message ?? String(result.reason) });
       } else {
         const { csvId, lat, lon, ts, tax } = result.value;
-        runQuery(
-          `INSERT OR REPLACE INTO orders (id, latitude, longitude, subtotal, timestamp, zip_code, state,
-            tax_region, county_fips, state_rate, county_rate, city_rate, special_rate,
-            composite_tax_rate, tax_amount, total_amount, jurisdictions)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [csvId, lat, lon, parseFloat(row.subtotal), ts, tax.zip_code, tax.state, tax.tax_region,
-           tax.county_fips, tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
-           tax.composite_tax_rate, tax.tax_amount, tax.total_amount, JSON.stringify(tax.jurisdictions)]
-        );
+        
+        // Check if order already exists
+        const existing = queryOne("SELECT id FROM orders WHERE id = ?", [csvId]);
+        
+        if (existing) {
+          // Update existing order, preserving its original import_session_id
+          runQuery(
+            `UPDATE orders SET latitude = ?, longitude = ?, subtotal = ?, timestamp = ?, zip_code = ?, state = ?,
+              tax_region = ?, county_fips = ?, state_rate = ?, county_rate = ?, city_rate = ?, special_rate = ?,
+              composite_tax_rate = ?, tax_amount = ?, total_amount = ?, jurisdictions = ?
+             WHERE id = ?`,
+            [lat, lon, parseFloat(row.subtotal), ts, tax.zip_code, tax.state, tax.tax_region,
+             tax.county_fips, tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
+             tax.composite_tax_rate, tax.tax_amount, tax.total_amount, JSON.stringify(tax.jurisdictions), csvId]
+          );
+        } else {
+          // Insert new order with session ID
+          runQuery(
+            `INSERT INTO orders (id, latitude, longitude, subtotal, timestamp, zip_code, state,
+              tax_region, county_fips, state_rate, county_rate, city_rate, special_rate,
+              composite_tax_rate, tax_amount, total_amount, jurisdictions, import_session_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [csvId, lat, lon, parseFloat(row.subtotal), ts, tax.zip_code, tax.state, tax.tax_region,
+             tax.county_fips, tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
+             tax.composite_tax_rate, tax.tax_amount, tax.total_amount, JSON.stringify(tax.jurisdictions), sessionId]
+          );
+        }
+        
         success.push({ id: csvId, original_id: row.id });
       }
 
@@ -165,13 +186,15 @@ router.post("/import/stream", upload.single("file"), async (req: Request, res: R
   }
 
   if (cancelRequested) {
-    // Rollback all rows imported in this session
-    const importedIds = success.map((s) => s.id);
-    if (importedIds.length > 0) {
-      const placeholders = importedIds.map(() => "?").join(", ");
-      runQuery(`DELETE FROM orders WHERE id IN (${placeholders})`, importedIds);
-    }
-    send({ type: "cancelled", rolledBack: importedIds.length });
+    // Rollback: delete ONLY orders with this session ID (newly inserted ones)
+    const rolledBack = queryOne(
+      `SELECT COUNT(*) as cnt FROM orders WHERE import_session_id = ?`,
+      [sessionId]
+    ) as any;
+    const count = rolledBack?.cnt ?? 0;
+    
+    runQuery(`DELETE FROM orders WHERE import_session_id = ?`, [sessionId]);
+    send({ type: "cancelled", rolledBack: count });
   } else {
     send({ type: "done", success: success.length, failed: failed.length, errors: failed.slice(0, 20) });
   }
@@ -226,18 +249,35 @@ router.post("/import", upload.single("file"), async (req: Request, res: Response
       }
 
       const { csvId, lat, lon, ts, tax } = result.value;
-      const id = runQuery(
-        `INSERT OR REPLACE INTO orders (id, latitude, longitude, subtotal, timestamp, zip_code, state,
-          tax_region, county_fips, state_rate, county_rate, city_rate, special_rate,
-          composite_tax_rate, tax_amount, total_amount, jurisdictions)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [csvId, lat, lon, parseFloat(row.subtotal), ts, tax.zip_code, tax.state, tax.tax_region,
-         tax.county_fips,
-         tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
-         tax.composite_tax_rate, tax.tax_amount, tax.total_amount,
-         JSON.stringify(tax.jurisdictions)]
-      );
-      success.push({ id, original_id: row.id });
+      
+      // Check if order already exists
+      const existing = queryOne("SELECT id FROM orders WHERE id = ?", [csvId]);
+      
+      if (existing) {
+        // Update existing order
+        runQuery(
+          `UPDATE orders SET latitude = ?, longitude = ?, subtotal = ?, timestamp = ?, zip_code = ?, state = ?,
+            tax_region = ?, county_fips = ?, state_rate = ?, county_rate = ?, city_rate = ?, special_rate = ?,
+            composite_tax_rate = ?, tax_amount = ?, total_amount = ?, jurisdictions = ?
+           WHERE id = ?`,
+          [lat, lon, parseFloat(row.subtotal), ts, tax.zip_code, tax.state, tax.tax_region,
+           tax.county_fips, tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
+           tax.composite_tax_rate, tax.tax_amount, tax.total_amount, JSON.stringify(tax.jurisdictions), csvId]
+        );
+      } else {
+        // Insert new order without session ID (for non-streaming import)
+        runQuery(
+          `INSERT INTO orders (id, latitude, longitude, subtotal, timestamp, zip_code, state,
+            tax_region, county_fips, state_rate, county_rate, city_rate, special_rate,
+            composite_tax_rate, tax_amount, total_amount, jurisdictions, import_session_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [csvId, lat, lon, parseFloat(row.subtotal), ts, tax.zip_code, tax.state, tax.tax_region,
+           tax.county_fips, tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
+           tax.composite_tax_rate, tax.tax_amount, tax.total_amount, JSON.stringify(tax.jurisdictions), null]
+        );
+      }
+      
+      success.push({ id: csvId, original_id: row.id });
     }
   }
 

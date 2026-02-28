@@ -36,6 +36,7 @@ export async function initDb(): Promise<void> {
       tax_amount         REAL    DEFAULT 0,
       total_amount       REAL    DEFAULT 0,
       jurisdictions      TEXT,   -- JSON array, e.g. ["New York State","New York City","MCTD"]
+      import_session_id  TEXT,   -- tracks which import session this order came from (for rollback)
       created_at         TEXT    DEFAULT (datetime('now'))
     );
   `);
@@ -55,6 +56,7 @@ function runMigrations(): void {
   const migrations = [
     `ALTER TABLE orders ADD COLUMN county_fips   TEXT`,
     `ALTER TABLE orders ADD COLUMN jurisdictions TEXT`,
+    `ALTER TABLE orders ADD COLUMN import_session_id TEXT`,
   ];
   for (const sql of migrations) {
     try { db.run(sql); } catch { /* column already exists — safe to ignore */ }
