@@ -3,7 +3,7 @@ import { Router, Request, Response } from "express";
 import multer from "multer";
 import { parse } from "csv-parse/sync";
 import { runQuery, queryAll, queryOne, getMaxId } from "./db";
-import { calculateTax, coordsToZip, isInNewYork } from "./tax";
+import { calculateTax, isInNewYork } from "./tax";
 import { authMiddleware } from "./auth";
 
 const router = Router();
@@ -12,7 +12,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 
 router.use(authMiddleware);
 
-// GET /orders — paginated list with optional filters: state, min_total, max_total
+// GET /orders — paginated list with optional filters: region (partial match), min_total, max_total
 router.get("/", (req: Request, res: Response) => {
   const page = Math.max(1, parseInt(req.query.page as string) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
@@ -21,19 +21,33 @@ router.get("/", (req: Request, res: Response) => {
   const filters: string[] = [];
   const params: any[] = [];
 
-  if (req.query.state) {
-    const s = String(req.query.state).toUpperCase();
-    filters.push("state = ?");
-    params.push(s === "NEW YORK" ? "NY" : s);
+  // Case-insensitive partial match on tax_region.
+  // e.g. "bronx" → "New York City (Bronx)"
+  //      "york"  → all 5 NYC boroughs at once
+  //      "county" → all county-level orders
+  if (req.query.region) {
+    filters.push("LOWER(tax_region) LIKE LOWER(?)");
+    params.push(`%${String(req.query.region).trim()}%`);
   }
-  if (req.query.min_total) { filters.push("total_amount >= ?"); params.push(parseFloat(req.query.min_total as string)); }
-  if (req.query.max_total) { filters.push("total_amount <= ?"); params.push(parseFloat(req.query.max_total as string)); }
+  if (req.query.min_total) {
+    filters.push("total_amount >= ?");
+    params.push(parseFloat(req.query.min_total as string));
+  }
+  if (req.query.max_total) {
+    filters.push("total_amount <= ?");
+    params.push(parseFloat(req.query.max_total as string));
+  }
 
   const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
   const total = (queryOne(`SELECT COUNT(*) as cnt FROM orders ${where}`, params) as any)?.cnt ?? 0;
   const orders = queryAll(`SELECT * FROM orders ${where} ORDER BY id DESC LIMIT ? OFFSET ?`, [...params, limit, offset]);
 
-  res.json({ total, page, limit, pages: Math.ceil(total / limit), orders });
+  const parsed = orders.map((o) => ({
+    ...o,
+    jurisdictions: safeParseJson(o.jurisdictions, []),
+  }));
+
+  res.json({ total, page, limit, pages: Math.ceil(total / limit), orders: parsed });
 });
 
 // POST /orders — manually create a single order, tax is calculated immediately
@@ -45,24 +59,29 @@ router.post("/", async (req: Request, res: Response) => {
   const lat = parseFloat(latitude), lon = parseFloat(longitude), sub = parseFloat(subtotal);
   if (isNaN(lat) || isNaN(lon) || isNaN(sub)) { res.status(400).json({ error: "Invalid numbers" }); return; }
   if (sub <= 0) { res.status(400).json({ error: "subtotal must be positive" }); return; }
-  // Reject orders outside NY — our license only covers New York State
   if (!isInNewYork(lat, lon)) { res.status(422).json({ error: "Coordinates outside New York State" }); return; }
 
-  const zip = await coordsToZip(lat, lon);
-  const tax = calculateTax(sub, zip, lat, lon);
+  const tax = await calculateTax(sub, null, lat, lon);
   const ts = timestamp || new Date().toISOString();
   const newId = getMaxId() + 1;
 
   const id = runQuery(
     `INSERT INTO orders (id, latitude, longitude, subtotal, timestamp, zip_code, state, tax_region,
-      state_rate, county_rate, city_rate, special_rate, composite_tax_rate, tax_amount, total_amount)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      county_fips, state_rate, county_rate, city_rate, special_rate, composite_tax_rate,
+      tax_amount, total_amount, jurisdictions)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [newId, lat, lon, sub, ts, tax.zip_code, tax.state, tax.tax_region,
+     tax.county_fips,
      tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
-     tax.composite_tax_rate, tax.tax_amount, tax.total_amount]
+     tax.composite_tax_rate, tax.tax_amount, tax.total_amount,
+     JSON.stringify(tax.jurisdictions)]
   );
 
-  res.status(201).json(queryOne("SELECT * FROM orders WHERE id = ?", [id]));
+  const order = queryOne("SELECT * FROM orders WHERE id = ?", [id]);
+  res.status(201).json({
+    ...order,
+    jurisdictions: safeParseJson(order?.jurisdictions, []),
+  });
 });
 
 // POST /orders/import — bulk import from CSV file, preserves original IDs
@@ -78,30 +97,52 @@ router.post("/import", upload.single("file"), async (req: Request, res: Response
 
   const success: any[] = [], failed: any[] = [];
 
-  for (const row of rows) {
-    try {
-      const lat = parseFloat(row.latitude), lon = parseFloat(row.longitude), sub = parseFloat(row.subtotal);
-      if (isNaN(lat) || isNaN(lon) || isNaN(sub)) throw new Error("Invalid numbers");
-      if (sub <= 0) throw new Error("subtotal must be positive");
-      if (!isInNewYork(lat, lon)) throw new Error("Coordinates outside New York State");
+  // Process rows in parallel batches — Census Geocoder calls are I/O-bound,
+  // so concurrent requests cut total import time significantly.
+  // Batch size of 5 is a safe balance between speed and API rate limits.
+  const BATCH_SIZE = 5;
 
-      const zip = await coordsToZip(lat, lon);
-      const tax = calculateTax(sub, zip, lat, lon);
-      const ts = row.timestamp || new Date().toISOString();
-      const csvId = parseInt(row.id);
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const batch = rows.slice(i, i + BATCH_SIZE);
 
-      // INSERT OR REPLACE preserves original CSV id and handles re-imports
+    const results = await Promise.allSettled(
+      batch.map(async (row) => {
+        const lat = parseFloat(row.latitude), lon = parseFloat(row.longitude), sub = parseFloat(row.subtotal);
+        if (isNaN(lat) || isNaN(lon) || isNaN(sub)) throw new Error("Invalid numbers");
+        if (sub <= 0) throw new Error("subtotal must be positive");
+        if (!isInNewYork(lat, lon)) throw new Error("Coordinates outside New York State");
+
+        const tax = await calculateTax(sub, null, lat, lon);
+        const ts = row.timestamp || new Date().toISOString();
+        const csvId = parseInt(row.id);
+
+        return { row, csvId, lat, lon, ts, tax };
+      })
+    );
+
+    // Write results to DB sequentially (sql.js is single-threaded)
+    for (let j = 0; j < results.length; j++) {
+      const result = results[j];
+      const row = batch[j];
+
+      if (result.status === "rejected") {
+        failed.push({ original_id: row.id, error: result.reason?.message ?? String(result.reason) });
+        continue;
+      }
+
+      const { csvId, lat, lon, ts, tax } = result.value;
       const id = runQuery(
-        `INSERT OR REPLACE INTO orders (id, latitude, longitude, subtotal, timestamp, zip_code, state, tax_region,
-          state_rate, county_rate, city_rate, special_rate, composite_tax_rate, tax_amount, total_amount)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [csvId, lat, lon, sub, ts, tax.zip_code, tax.state, tax.tax_region,
+        `INSERT OR REPLACE INTO orders (id, latitude, longitude, subtotal, timestamp, zip_code, state,
+          tax_region, county_fips, state_rate, county_rate, city_rate, special_rate,
+          composite_tax_rate, tax_amount, total_amount, jurisdictions)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [csvId, lat, lon, parseFloat(row.subtotal), ts, tax.zip_code, tax.state, tax.tax_region,
+         tax.county_fips,
          tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
-         tax.composite_tax_rate, tax.tax_amount, tax.total_amount]
+         tax.composite_tax_rate, tax.tax_amount, tax.total_amount,
+         JSON.stringify(tax.jurisdictions)]
       );
       success.push({ id, original_id: row.id });
-    } catch (e: any) {
-      failed.push({ original_id: row.id, error: e.message });
     }
   }
 
@@ -113,5 +154,15 @@ router.delete("/", (req: Request, res: Response) => {
   runQuery("DELETE FROM orders", []);
   res.json({ ok: true });
 });
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function safeParseJson<T>(value: unknown, fallback: T): T {
+  if (value == null) return fallback;
+  if (typeof value !== "string") return fallback;
+  try { return JSON.parse(value) as T; } catch { return fallback; }
+}
 
 export default router;

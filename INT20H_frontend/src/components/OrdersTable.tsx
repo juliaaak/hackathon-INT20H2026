@@ -10,7 +10,7 @@ export default function OrdersTable({ refreshKey }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [page, setPage] = useState(1);
-  const [filters, setFilters] = useState({ state: "", min_total: "", max_total: "" });
+  const [filters, setFilters] = useState({ region: "", min_total: "", max_total: "" });
   const [expanded, setExpanded] = useState<number | null>(null);
 
   const fetchOrders = useCallback(async () => {
@@ -38,19 +38,24 @@ export default function OrdersTable({ refreshKey }: Props) {
 
       {/* Filters */}
       <div style={styles.filters}>
-        <input style={styles.filterInput} placeholder="State (e.g. NY)" value={filters.state} onChange={(e) => setFilter("state", e.target.value)} />
+        <input
+          style={{ ...styles.filterInput, width: 200 }}
+          placeholder="Region (e.g. Bronx, Queens)"
+          value={filters.region}
+          onChange={(e) => setFilter("region", e.target.value)}
+        />
         <input style={styles.filterInput} type="number" placeholder="Min total" value={filters.min_total} onChange={(e) => setFilter("min_total", e.target.value)} />
         <input style={styles.filterInput} type="number" placeholder="Max total" value={filters.max_total} onChange={(e) => setFilter("max_total", e.target.value)} />
         <button onClick={fetchOrders} style={styles.refreshBtn}>🔄 Refresh</button>
         <button
-            onClick={async () => {
-                if (!confirm("Видалити всі замовлення?")) return;
-                await clearOrders();
-                fetchOrders();
-            }}
-            style={{ ...styles.refreshBtn, color: "red" }}
-            >
-            🗑️ Clear all
+          onClick={async () => {
+            if (!confirm("Видалити всі замовлення?")) return;
+            await clearOrders();
+            fetchOrders();
+          }}
+          style={{ ...styles.refreshBtn, color: "red" }}
+        >
+          🗑️ Clear all
         </button>
       </div>
 
@@ -79,7 +84,7 @@ export default function OrdersTable({ refreshKey }: Props) {
               <tbody>
                 {data.orders.map((o) => (
                   <React.Fragment key={o.id}>
-                    <tr key={o.id} style={styles.row}>
+                    <tr style={styles.row}>
                       <td style={styles.td}>{o.id}</td>
                       <td style={styles.td}>{o.timestamp?.slice(0, 19).replace("T", " ")}</td>
                       <td style={styles.td}>{o.tax_region}</td>
@@ -95,7 +100,7 @@ export default function OrdersTable({ refreshKey }: Props) {
                     </tr>
                     {expanded === o.id && (
                       <tr key={`${o.id}-detail`}>
-                        <td colSpan={9} style={styles.detailCell}>
+                        <td colSpan={8} style={styles.detailCell}>
                           <div style={styles.detailGrid}>
                             <span>📍 Lat: {o.latitude.toFixed(6)}</span>
                             <span>📍 Lon: {o.longitude.toFixed(6)}</span>

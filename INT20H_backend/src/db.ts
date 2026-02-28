@@ -19,25 +19,46 @@ export async function initDb(): Promise<void> {
   }
   db.run(`
     CREATE TABLE IF NOT EXISTS orders (
-      id INTEGER PRIMARY KEY,
-      latitude REAL NOT NULL,
-      longitude REAL NOT NULL,
-      subtotal REAL NOT NULL,
-      timestamp TEXT NOT NULL,
-      zip_code TEXT,
-      state TEXT,
-      tax_region TEXT,
-      state_rate REAL DEFAULT 0,
-      county_rate REAL DEFAULT 0,
-      city_rate REAL DEFAULT 0,
-      special_rate REAL DEFAULT 0,
-      composite_tax_rate REAL DEFAULT 0,
-      tax_amount REAL DEFAULT 0,
-      total_amount REAL DEFAULT 0,
-      created_at TEXT DEFAULT (datetime('now'))
+      id                 INTEGER PRIMARY KEY,
+      latitude           REAL    NOT NULL,
+      longitude          REAL    NOT NULL,
+      subtotal           REAL    NOT NULL,
+      timestamp          TEXT    NOT NULL,
+      zip_code           TEXT,
+      state              TEXT,
+      tax_region         TEXT,
+      county_fips        TEXT,
+      state_rate         REAL    DEFAULT 0,
+      county_rate        REAL    DEFAULT 0,
+      city_rate          REAL    DEFAULT 0,
+      special_rate       REAL    DEFAULT 0,
+      composite_tax_rate REAL    DEFAULT 0,
+      tax_amount         REAL    DEFAULT 0,
+      total_amount       REAL    DEFAULT 0,
+      jurisdictions      TEXT,   -- JSON array, e.g. ["New York State","New York City","MCTD"]
+      created_at         TEXT    DEFAULT (datetime('now'))
     );
   `);
+
+  // Non-destructive migration: add new columns to existing databases
+  runMigrations();
+
   persist();
+}
+
+/**
+ * Idempotent migrations — add columns that may not exist in older DB files.
+ * ALTER TABLE in SQLite cannot check for column existence, so we attempt each
+ * and silently swallow "duplicate column" errors.
+ */
+function runMigrations(): void {
+  const migrations = [
+    `ALTER TABLE orders ADD COLUMN county_fips   TEXT`,
+    `ALTER TABLE orders ADD COLUMN jurisdictions TEXT`,
+  ];
+  for (const sql of migrations) {
+    try { db.run(sql); } catch { /* column already exists — safe to ignore */ }
+  }
 }
 
 // Save DB state to disk after every write

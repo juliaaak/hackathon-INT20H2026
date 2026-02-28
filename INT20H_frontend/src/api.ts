@@ -7,6 +7,7 @@ export interface Order {
   zip_code: string | null;
   state: string;
   tax_region: string;
+  county_fips: string | null;
   state_rate: number;
   county_rate: number;
   city_rate: number;
@@ -14,6 +15,7 @@ export interface Order {
   composite_tax_rate: number;
   tax_amount: number;
   total_amount: number;
+  jurisdictions: string[];
   created_at: string;
 }
 
@@ -66,13 +68,14 @@ export async function logout() {
 export async function getOrders(params: {
   page?: number;
   limit?: number;
-  state?: string;
-  zip_code?: string;
+  region?: string;    // partial case-insensitive match on tax_region
   min_total?: string;
   max_total?: string;
 }): Promise<OrdersResponse> {
   const q = new URLSearchParams();
-  Object.entries(params).forEach(([k, v]) => v && q.set(k, String(v)));
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== "") q.set(k, String(v));
+  });
   const res = await fetch(`${BASE}/orders?${q}`, { headers: headers() });
   if (!res.ok) throw new Error("Failed to fetch orders");
   return res.json();
