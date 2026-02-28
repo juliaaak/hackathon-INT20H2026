@@ -35,8 +35,11 @@ export default function ImportCSV({ onSuccess }: Props) {
   }, [result]);
 
   function handleFileChange() {
-    setResult(null); setError(""); setRowCount(null);
-    setProcessed(0); setCancelled(false);
+    setResult(null);
+    setError("");
+    setRowCount(null);
+    setProcessed(0);
+    setCancelled(false);
     const file = fileRef.current?.files?.[0];
     if (!file) return;
     const reader = new FileReader();
@@ -58,15 +61,20 @@ export default function ImportCSV({ onSuccess }: Props) {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify({ sessionId }),
     });
-    // UI will update when backend sends "cancelled" event through the stream
   }
 
   async function handleImport() {
     const file = fileRef.current?.files?.[0];
-    if (!file) { setError("Please select a CSV file"); return; }
+    if (!file) {
+      setError("Please select a CSV file");
+      return;
+    }
 
-    setError(""); setResult(null); setProcessed(0);
-    setCancelled(false); setLoading(true);
+    setError("");
+    setResult(null);
+    setProcessed(0);
+    setCancelled(false);
+    setLoading(true);
     sessionIdRef.current = null;
 
     try {
@@ -102,7 +110,6 @@ export default function ImportCSV({ onSuccess }: Props) {
             sessionIdRef.current = json.sessionId;
           } else if (json.type === "progress") {
             setProcessed(json.processed);
-            // Refresh table every 25 rows so new records appear in real time
             if (json.processed % 25 === 0) onSuccess();
           } else if (json.type === "cancelled") {
             setRolledBack(json.rolledBack);
@@ -126,13 +133,43 @@ export default function ImportCSV({ onSuccess }: Props) {
 
   return (
     <div style={styles.card}>
-      <h3 style={styles.title}>📂 Import CSV</h3>
-      <p style={styles.hint}>Expected columns: <code>id, longitude, latitude, timestamp, subtotal</code></p>
+      <style>{`
+        @keyframes slideIn {
+          from {
+            opacity: 0;
+            transform: translateX(-10px);
+          }
+          to {
+            opacity: 1;
+            transform: translateX(0);
+          }
+        }
+        
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.7; }
+        }
+      `}</style>
+
+      <div style={styles.header}>
+        <span style={styles.icon}>📂</span>
+        <h3 style={styles.title}>Import CSV</h3>
+      </div>
+
+      <p style={styles.hint}>
+        Expected columns: <code style={styles.code}>id, longitude, latitude, timestamp, subtotal</code>
+      </p>
 
       <div style={styles.row}>
-        <input ref={fileRef} type="file" accept=".csv" style={styles.fileInput} onChange={handleFileChange} />
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".csv"
+          style={styles.fileInput}
+          onChange={handleFileChange}
+        />
         <button onClick={handleImport} disabled={loading} style={styles.btn}>
-          {loading ? "Importing..." : "Import"}
+          {loading ? "📤 Importing..." : "Import"}
         </button>
         {loading && (
           <button onClick={handleCancel} style={styles.cancelBtn}>
@@ -144,11 +181,19 @@ export default function ImportCSV({ onSuccess }: Props) {
       {loading && rowCount !== null && (
         <div style={styles.progressWrap}>
           <div style={styles.progressTrack}>
-            <div style={{ ...styles.progressFill, width: `${percent}%` }} />
+            <div
+              style={{
+                ...styles.progressFill,
+                width: `${percent}%`,
+              }}
+            />
           </div>
-          <p style={styles.progressText}>
-            ⏳ {processed} / {rowCount} rows processed ({percent}%)
-          </p>
+          <div style={styles.progressLabel}>
+            <span style={styles.progressText}>
+              ⏳ {processed} / {rowCount} rows
+            </span>
+            <span style={styles.progressPercent}>{percent}%</span>
+          </div>
           <p style={styles.progressHint}>
             Each row requires a geocoding request via Census API
           </p>
@@ -156,15 +201,34 @@ export default function ImportCSV({ onSuccess }: Props) {
       )}
 
       {cancelled && (
-        <div style={styles.cancelledBanner}>
+        <div
+          style={{
+            ...styles.banner,
+            ...styles.cancelledBanner,
+          }}
+        >
           ⚠️ Import cancelled — {rolledBack} rows were removed from the database.
         </div>
       )}
 
-      {error && <p style={{ color: "red", marginTop: 8 }}>{error}</p>}
+      {error && (
+        <div
+          style={{
+            ...styles.banner,
+            ...styles.errorBanner,
+          }}
+        >
+          ❌ {error}
+        </div>
+      )}
 
       {result && !cancelled && (
-        <div style={styles.result}>
+        <div
+          style={{
+            ...styles.resultBox,
+            animation: "slideIn 0.4s ease-out",
+          }}
+        >
           <div style={styles.resultRow}>
             <span style={styles.successBadge}>✅ {result.success} imported</span>
             {result.failed > 0 && <span style={styles.failBadge}>❌ {result.failed} failed</span>}
@@ -172,7 +236,11 @@ export default function ImportCSV({ onSuccess }: Props) {
           </div>
           {result.errors.length > 0 && (
             <ul style={styles.errorList}>
-              {result.errors.map((e, i) => <li key={i}>Row {e.original_id}: {e.error}</li>)}
+              {result.errors.map((e, i) => (
+                <li key={i} style={styles.errorItem}>
+                  Row {e.original_id}: <span style={styles.errorMsg}>{e.error}</span>
+                </li>
+              ))}
             </ul>
           )}
         </div>
@@ -182,23 +250,213 @@ export default function ImportCSV({ onSuccess }: Props) {
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  card: { background: "#fff", borderRadius: 12, padding: 24, boxShadow: "0 2px 12px rgba(0,0,0,0.08)", marginBottom: 24 },
-  title: { margin: "0 0 8px", color: "#1a1a2e" },
-  hint: { margin: "0 0 16px", color: "#666", fontSize: 14 },
-  row: { display: "flex", gap: 12, alignItems: "center" },
-  fileInput: { flex: 1, padding: "8px", border: "1px solid #ddd", borderRadius: 8 },
-  btn: { padding: "10px 20px", background: "#4f46e5", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", whiteSpace: "nowrap" },
-  cancelBtn: { padding: "10px 16px", background: "#fee2e2", color: "#dc2626", border: "1px solid #fca5a5", borderRadius: 8, cursor: "pointer", whiteSpace: "nowrap", fontWeight: 500 },
-  progressWrap: { marginTop: 16 },
-  progressTrack: { height: 8, background: "#e5e7eb", borderRadius: 99, overflow: "hidden", marginBottom: 8 },
-  progressFill: { height: "100%", background: "linear-gradient(90deg, #4f46e5, #818cf8)", borderRadius: 99, transition: "width 0.3s ease" },
-  progressText: { margin: "0 0 4px", fontSize: 14, color: "#374151", fontWeight: 500 },
-  progressHint: { margin: 0, fontSize: 12, color: "#9ca3af" },
-  cancelledBanner: { marginTop: 12, padding: "10px 14px", background: "#fef9c3", border: "1px solid #fde68a", borderRadius: 8, fontSize: 14, color: "#92400e" },
-  result: { marginTop: 12, padding: 12, background: "#f9fafb", borderRadius: 8 },
-  resultRow: { display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" },
-  successBadge: { color: "#16a34a", fontWeight: 500 },
-  failBadge: { color: "#dc2626", fontWeight: 500 },
-  totalBadge: { color: "#6b7280", fontSize: 13 },
-  errorList: { marginTop: 8, fontSize: 13, color: "#666", paddingLeft: 16 },
+  card: {
+    background: "rgba(255, 255, 255, 0.95)",
+    backdropFilter: "blur(10px)",
+    borderRadius: 16,
+    padding: 28,
+    boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+    border: "1px solid rgba(255, 255, 255, 0.5)",
+  },
+
+  header: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    marginBottom: 16,
+  },
+
+  icon: {
+    fontSize: 24,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: 40,
+    height: 40,
+    background: "linear-gradient(135deg, #667eea, #764ba2)",
+    borderRadius: 12,
+    boxShadow: "0 4px 12px rgba(102, 126, 234, 0.3)",
+  },
+
+  title: {
+    margin: 0,
+    fontSize: 18,
+    fontWeight: 700,
+    color: "#1a1a2e",
+    letterSpacing: "-0.5px",
+  },
+
+  hint: {
+    margin: "0 0 16px 0",
+    color: "#6b7280",
+    fontSize: 13,
+  },
+
+  code: {
+    background: "rgba(102, 126, 234, 0.1)",
+    padding: "2px 6px",
+    borderRadius: 4,
+    color: "#667eea",
+    fontFamily: "monospace",
+    fontSize: 12,
+  },
+
+  row: {
+    display: "flex",
+    gap: 12,
+    alignItems: "center",
+    marginBottom: 16,
+  },
+
+  fileInput: {
+    flex: 1,
+    padding: "12px 14px",
+    border: "1.5px solid rgba(102, 126, 234, 0.2)",
+    borderRadius: 10,
+    fontSize: 13,
+    background: "rgba(255, 255, 255, 0.6)",
+    boxShadow: "inset 0 2px 4px rgba(0, 0, 0, 0.05)",
+    cursor: "pointer",
+  },
+
+  btn: {
+    padding: "12px 20px",
+    background: "linear-gradient(135deg, #667eea, #764ba2)",
+    color: "#fff",
+    border: "none",
+    borderRadius: 10,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+    fontWeight: 600,
+    fontSize: 13,
+    boxShadow: "0 4px 12px rgba(102, 126, 234, 0.3)",
+    transition: "all 0.3s ease",
+  },
+
+  cancelBtn: {
+    padding: "12px 16px",
+    background: "rgba(239, 68, 68, 0.1)",
+    color: "#dc2626",
+    border: "1.5px solid rgba(239, 68, 68, 0.3)",
+    borderRadius: 10,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+    fontWeight: 600,
+    fontSize: 13,
+    transition: "all 0.3s ease",
+  },
+
+  progressWrap: {
+    marginBottom: 16,
+  },
+
+  progressTrack: {
+    height: 8,
+    background: "rgba(0, 0, 0, 0.05)",
+    borderRadius: 99,
+    overflow: "hidden",
+    marginBottom: 8,
+    boxShadow: "inset 0 2px 4px rgba(0, 0, 0, 0.05)",
+  },
+
+  progressFill: {
+    height: "100%",
+    background: "linear-gradient(90deg, #667eea, #764ba2)",
+    borderRadius: 99,
+    transition: "width 0.3s ease",
+    boxShadow: "0 0 12px rgba(102, 126, 234, 0.5)",
+  },
+
+  progressLabel: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 4,
+  },
+
+  progressText: {
+    fontSize: 13,
+    color: "#374151",
+    fontWeight: 600,
+  },
+
+  progressPercent: {
+    fontSize: 13,
+    color: "#667eea",
+    fontWeight: 700,
+  },
+
+  progressHint: {
+    margin: 0,
+    fontSize: 12,
+    color: "#9ca3af",
+  },
+
+  banner: {
+    marginBottom: 16,
+    padding: "12px 14px",
+    borderRadius: 10,
+    fontSize: 13,
+    fontWeight: 500,
+  },
+
+  cancelledBanner: {
+    background: "rgba(251, 191, 36, 0.1)",
+    border: "1px solid rgba(251, 191, 36, 0.3)",
+    color: "#92400e",
+  },
+
+  errorBanner: {
+    background: "rgba(239, 68, 68, 0.1)",
+    border: "1px solid rgba(239, 68, 68, 0.3)",
+    color: "#dc2626",
+  },
+
+  resultBox: {
+    padding: 14,
+    background: "linear-gradient(135deg, rgba(34, 197, 94, 0.05), rgba(34, 197, 94, 0.02))",
+    borderRadius: 10,
+    border: "1.5px solid rgba(34, 197, 94, 0.3)",
+  },
+
+  resultRow: {
+    display: "flex",
+    gap: 12,
+    alignItems: "center",
+    flexWrap: "wrap",
+    marginBottom: 12,
+  },
+
+  successBadge: {
+    color: "#16a34a",
+    fontWeight: 700,
+    fontSize: 13,
+  },
+
+  failBadge: {
+    color: "#dc2626",
+    fontWeight: 700,
+    fontSize: 13,
+  },
+
+  totalBadge: {
+    color: "#6b7280",
+    fontSize: 12,
+  },
+
+  errorList: {
+    margin: 0,
+    paddingLeft: 16,
+    fontSize: 12,
+    color: "#666",
+  },
+
+  errorItem: {
+    marginBottom: 4,
+  },
+
+  errorMsg: {
+    color: "#dc2626",
+    fontWeight: 500,
+  },
 };
