@@ -18,11 +18,11 @@ This admin tool solves the problem: given GPS coordinates of a delivery, it dete
 ```
 GPS coordinates (lat, lon)
         ↓
-Check if within New York State bounding box
+Check if within New York State bounding box (fast pre-check)
         ↓
-Match coordinates against known jurisdiction bounding boxes
+Call US Census Bureau Geocoder → county FIPS code
         ↓
-Return composite tax rate for that jurisdiction
+Look up composite tax rate from official NYS Publication 718 table
         ↓
 tax_amount = subtotal × composite_tax_rate
 total_amount = subtotal + tax_amount
@@ -40,10 +40,12 @@ timestamp             — when the order was placed
 composite_tax_rate    — e.g. 0.08875 (8.875%)
 tax_amount            — e.g. $10.65
 total_amount          — e.g. $130.65
+county_fips           — e.g. "36061" (New York County)
+jurisdictions         — e.g. ["New York State", "New York City", "MCTD"]
 breakdown:
   state_rate          — 4.000% (uniform across NY)
   county_rate         — varies by county
-  city_rate           — 0.375% in NYC, 0% elsewhere
+  city_rate           — MCTD surcharge 0.375% in Metro area, 0% elsewhere
   special_rate        — additional district rates
 tax_region            — jurisdiction name (e.g. "New York City (Manhattan)")
 ```
@@ -51,25 +53,25 @@ tax_region            — jurisdiction name (e.g. "New York City (Manhattan)")
 ### Example
 ```
 Input:  lat=40.7128, lon=-74.0060, subtotal=$120.00
-→ Jurisdiction: New York City (Manhattan)
-→ state: 4.000% + county: 4.500% + city: 0.375% = 8.875%
+→ Census Geocoder → FIPS 36061 → New York County (Manhattan)
+→ state: 4.000% + county: 4.500% + MCTD: 0.375% = 8.875%
 → tax_amount: $10.65
 → total_amount: $130.65
 ```
 
 ### Tax Rate Sources
-Rates are based on official **NY State Department of Taxation and Finance** data (2024). Key jurisdictions covered:
+Rates are based on official **NYS Publication 718** (NY State Department of Taxation and Finance, 2024 Q4), keyed by county FIPS code. All 62 NY counties are covered.
 
 | Jurisdiction | Rate |
 |---|---|
 | New York City (all 5 boroughs) | 8.875% |
 | Nassau County | 8.625% |
 | Suffolk County | 8.625% |
-| Westchester / Rockland | 8.375% |
-| Erie County (Buffalo) | 8.750% |
-| Monroe County (Rochester) | 8.000% |
-| Onondaga County (Syracuse) | 8.000% |
-| Albany County | 8.000% |
+| Westchester / Rockland / Putnam | 8.375% |
+| Orange / Dutchess | 8.125% |
+| Erie / Niagara / Oneida | 8.750% |
+| Cattaraugus County | 9.000% |
+| Albany / Monroe / Onondaga | 8.000% |
 | Most other NY counties | 8.000% |
 
 ---
@@ -82,10 +84,13 @@ Rates are based on official **NY State Department of Taxation and Finance** data
 | Database | SQLite via sql.js (pure JS, no native compilation) |
 | Frontend | React + TypeScript + Vite |
 | Auth | Token-based session auth |
+| Geocoding | US Census Bureau Geocoder (free, no API key) |
 
 > **Why sql.js instead of better-sqlite3?** better-sqlite3 requires native compilation (node-gyp) which fails on Node.js v25. sql.js is a pure JavaScript SQLite port — same functionality, zero build issues.
 
-> **Why coordinate-based jurisdiction lookup instead of ZIP codes?** External geocoding APIs (US Census) have latency and reliability issues for bulk imports. Bounding box matching is instant, offline, and accurate enough for NY State jurisdictions.
+> **Why Census Geocoder instead of bounding boxes?** Bounding boxes overlap at county borders and produce wrong results for edge cases. The Census Bureau Geocoder resolves coordinates to an exact county FIPS code — the same identifier used by NYS tax authorities. It's free, official, and requires no API key.
+
+> **Why FIPS codes instead of ZIP codes?** Tax jurisdictions in NY align with counties, not ZIP codes. FIPS is the authoritative identifier for this purpose.
 
 ---
 
@@ -99,8 +104,8 @@ INT20H/
 │   ├── tsconfig.json
 │   └── src/
 │       ├── index.ts      # Express app entry point
-│       ├── db.ts         # SQLite database layer
-│       ├── tax.ts        # Tax calculation logic
+│       ├── db.ts         # SQLite database layer (+ auto-migration)
+│       ├── tax.ts        # Tax calculation logic (Census Geocoder + NYS Pub 718)
 │       ├── auth.ts       # Token-based auth
 │       └── orders.ts     # Orders API routes
 └── INT20H_frontend/
@@ -167,7 +172,7 @@ All endpoints except `/api/login` require `Authorization: Bearer <token>`.
 
 ### GET /api/orders params
 - `page`, `limit` — pagination
-- `state` — filter by state (NY or "New York")
+- `region` — partial case-insensitive search on tax_region (e.g. "bronx", "queens", "county")
 - `min_total`, `max_total` — filter by total amount
 
 ### CSV Format
@@ -180,8 +185,10 @@ id,longitude,latitude,timestamp,subtotal
 
 ## Assumptions
 
-1. **Coordinate-based jurisdiction lookup** — bounding boxes per county/borough. Accurate enough for NY State; a production system would use a proper geocoding service with ZIP+4 precision.
-2. **Orders outside NY are rejected** — the company's drone license covers NY State only.
-3. **Tax rates are hardcoded** — from official NY State Dept of Taxation data (2024). Rates change rarely; a production system would pull from Avalara or TaxJar.
-4. **IDs from CSV are preserved** — original order IDs are kept in the database.
-5. **sql.js used instead of better-sqlite3** — due to Node.js v25 compatibility issues with native modules on Windows.
+1. **Census Geocoder for jurisdiction resolution** — coordinates are resolved to county FIPS via the US Census Bureau API (free, no key). If the API is unreachable, the system falls back to a default 8% NY State rate and logs a warning rather than failing hard.
+2. **County-level rates only** — sub-county city surtaxes (e.g. Yonkers city tax within Westchester County) are not modelled. This is a known limitation; a production system would use Avalara or TaxJar for full precision.
+3. **MCTD surcharge** — the 0.375% Metropolitan Commuter Transportation District surcharge is correctly applied to NYC + Nassau + Suffolk + Westchester + Rockland + Orange + Dutchess + Putnam counties. It is stored in the `city_rate` field for API compatibility.
+4. **Orders outside NY are rejected** — the company's drone license covers NY State only.
+5. **Tax rates are from NYS Pub 718 (2024 Q4)** — hardcoded by county FIPS. Rates change rarely; a production system would pull from a live tax API.
+6. **IDs from CSV are preserved** — original order IDs are kept; re-importing the same CSV is idempotent (INSERT OR REPLACE).
+7. **sql.js used instead of better-sqlite3** — due to Node.js v25 compatibility issues with native modules on Windows.
