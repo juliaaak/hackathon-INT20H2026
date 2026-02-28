@@ -10,6 +10,9 @@ const router = Router();
 // Accept files up to 10MB in memory
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
+// Registry of active import sessions: sessionId → cancel function
+const importSessions = new Map<string, () => void>();
+
 router.use(authMiddleware);
 
 // GET /orders — paginated list with optional filters: region (partial match), min_total, max_total
@@ -107,9 +110,17 @@ router.post("/import/stream", upload.single("file"), async (req: Request, res: R
 
   const success: any[] = [], failed: any[] = [];
   let processed = 0;
+  let cancelRequested = false;
   const BATCH_SIZE = 5;
 
+  // Register cancel function so POST /orders/import/cancel can trigger it
+  const sessionId = `${Date.now()}-${Math.random()}`;
+  importSessions.set(sessionId, () => { cancelRequested = true; });
+  send({ type: "session", sessionId });
+
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    if (cancelRequested) break;
+
     const batch = rows.slice(i, i + BATCH_SIZE);
 
     const results = await Promise.allSettled(
@@ -153,7 +164,18 @@ router.post("/import/stream", upload.single("file"), async (req: Request, res: R
     }
   }
 
-  send({ type: "done", success: success.length, failed: failed.length, errors: failed.slice(0, 20) });
+  if (cancelRequested) {
+    // Rollback all rows imported in this session
+    const importedIds = success.map((s) => s.id);
+    if (importedIds.length > 0) {
+      const placeholders = importedIds.map(() => "?").join(", ");
+      runQuery(`DELETE FROM orders WHERE id IN (${placeholders})`, importedIds);
+    }
+    send({ type: "cancelled", rolledBack: importedIds.length });
+  } else {
+    send({ type: "done", success: success.length, failed: failed.length, errors: failed.slice(0, 20) });
+  }
+  importSessions.delete(sessionId);
   res.end();
 });
 
@@ -220,6 +242,15 @@ router.post("/import", upload.single("file"), async (req: Request, res: Response
   }
 
   res.json({ success: success.length, failed: failed.length, errors: failed.slice(0, 20) });
+});
+
+// POST /orders/import/cancel — signal an active import session to stop
+router.post("/import/cancel", (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  const cancel = importSessions.get(sessionId);
+  if (!cancel) { res.status(404).json({ error: "Session not found or already finished" }); return; }
+  cancel();
+  res.json({ ok: true });
 });
 
 // POST /orders/rollback — delete specific order IDs (used when import is cancelled)

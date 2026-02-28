@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { ImportResult } from "../api";
 
 interface Props {
@@ -9,13 +9,30 @@ export default function ImportCSV({ onSuccess }: Props) {
   const [result, setResult] = useState<ImportResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [cancelled, setCancelled] = useState(false);
+  const [rolledBack, setRolledBack] = useState(0);
   const [error, setError] = useState("");
   const [rowCount, setRowCount] = useState<number | null>(null);
   const [processed, setProcessed] = useState(0);
   const fileRef = useRef<HTMLInputElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  // Track IDs imported in this session so we can roll them back on cancel
-  const importedIdsRef = useRef<number[]>([]);
+  const sessionIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!cancelled) return;
+    const t = setTimeout(() => setCancelled(false), 5000);
+    return () => clearTimeout(t);
+  }, [cancelled]);
+
+  useEffect(() => {
+    if (!error) return;
+    const t = setTimeout(() => setError(""), 5000);
+    return () => clearTimeout(t);
+  }, [error]);
+
+  useEffect(() => {
+    if (!result) return;
+    const t = setTimeout(() => setResult(null), 5000);
+    return () => clearTimeout(t);
+  }, [result]);
 
   function handleFileChange() {
     setResult(null); setError(""); setRowCount(null);
@@ -32,28 +49,16 @@ export default function ImportCSV({ onSuccess }: Props) {
   }
 
   async function handleCancel() {
-    // 1. Abort the SSE stream
-    abortRef.current?.abort();
+    const sessionId = sessionIdRef.current;
+    if (!sessionId) return;
 
-    // 2. Delete all rows that were already written to DB in this import
-    const ids = importedIdsRef.current;
-    if (ids.length > 0) {
-      const token = localStorage.getItem("token") || "";
-      await fetch("/api/orders/rollback", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ ids }),
-      });
-    }
-
-    importedIdsRef.current = [];
-    setCancelled(true);
-    setLoading(false);
-    setProcessed(0);
-    onSuccess(); // refresh table
+    const token = localStorage.getItem("token") || "";
+    await fetch("/api/orders/import/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ sessionId }),
+    });
+    // UI will update when backend sends "cancelled" event through the stream
   }
 
   async function handleImport() {
@@ -62,10 +67,7 @@ export default function ImportCSV({ onSuccess }: Props) {
 
     setError(""); setResult(null); setProcessed(0);
     setCancelled(false); setLoading(true);
-    importedIdsRef.current = [];
-
-    const controller = new AbortController();
-    abortRef.current = controller;
+    sessionIdRef.current = null;
 
     try {
       const token = localStorage.getItem("token") || "";
@@ -76,7 +78,6 @@ export default function ImportCSV({ onSuccess }: Props) {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
         body: form,
-        signal: controller.signal,
       });
 
       if (!res.ok || !res.body) throw new Error("Import failed");
@@ -97,10 +98,16 @@ export default function ImportCSV({ onSuccess }: Props) {
           if (!line.startsWith("data:")) continue;
           const json = JSON.parse(line.slice(5).trim());
 
-          if (json.type === "progress") {
+          if (json.type === "session") {
+            sessionIdRef.current = json.sessionId;
+          } else if (json.type === "progress") {
             setProcessed(json.processed);
-            // Track every successfully imported ID for potential rollback
-            if (json.id != null) importedIdsRef.current.push(json.id);
+            // Refresh table every 25 rows so new records appear in real time
+            if (json.processed % 25 === 0) onSuccess();
+          } else if (json.type === "cancelled") {
+            setRolledBack(json.rolledBack);
+            setCancelled(true);
+            onSuccess();
           } else if (json.type === "done") {
             setResult({ success: json.success, failed: json.failed, errors: json.errors });
             if (json.success > 0) onSuccess();
@@ -108,9 +115,10 @@ export default function ImportCSV({ onSuccess }: Props) {
         }
       }
     } catch (e: any) {
-      if (e.name !== "AbortError") setError(e.message);
+      setError(e.message);
     } finally {
       setLoading(false);
+      sessionIdRef.current = null;
     }
   }
 
@@ -149,7 +157,7 @@ export default function ImportCSV({ onSuccess }: Props) {
 
       {cancelled && (
         <div style={styles.cancelledBanner}>
-          ⚠️ Import cancelled — {processed} rows were removed from the database.
+          ⚠️ Import cancelled — {rolledBack} rows were removed from the database.
         </div>
       )}
 
