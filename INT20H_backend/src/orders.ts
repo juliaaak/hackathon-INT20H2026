@@ -84,6 +84,79 @@ router.post("/", async (req: Request, res: Response) => {
   });
 });
 
+// POST /orders/import/stream — same as /import but streams progress via SSE
+// Each processed row emits: data: {"type":"progress","processed":N}
+// Final event emits:        data: {"type":"done","success":N,"failed":N,"errors":[...]}
+router.post("/import/stream", upload.single("file"), async (req: Request, res: Response) => {
+  if (!req.file) { res.status(400).json({ error: "No file provided" }); return; }
+
+  let rows: any[];
+  try {
+    rows = parse(req.file.buffer.toString("utf-8"), { columns: true, skip_empty_lines: true, trim: true });
+  } catch (e: any) {
+    res.status(400).json({ error: "Invalid CSV: " + e.message }); return;
+  }
+
+  // Set SSE headers — keep connection open for streaming
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const send = (data: object) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+  const success: any[] = [], failed: any[] = [];
+  let processed = 0;
+  const BATCH_SIZE = 5;
+
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const batch = rows.slice(i, i + BATCH_SIZE);
+
+    const results = await Promise.allSettled(
+      batch.map(async (row) => {
+        const lat = parseFloat(row.latitude), lon = parseFloat(row.longitude), sub = parseFloat(row.subtotal);
+        if (isNaN(lat) || isNaN(lon) || isNaN(sub)) throw new Error("Invalid numbers");
+        if (sub <= 0) throw new Error("subtotal must be positive");
+        if (!isInNewYork(lat, lon)) throw new Error("Coordinates outside New York State");
+
+        const tax = await calculateTax(sub, null, lat, lon);
+        const ts = row.timestamp || new Date().toISOString();
+        const csvId = parseInt(row.id);
+
+        return { row, csvId, lat, lon, ts, tax };
+      })
+    );
+
+    for (let j = 0; j < results.length; j++) {
+      const result = results[j];
+      const row = batch[j];
+
+      if (result.status === "rejected") {
+        failed.push({ original_id: row.id, error: result.reason?.message ?? String(result.reason) });
+      } else {
+        const { csvId, lat, lon, ts, tax } = result.value;
+        runQuery(
+          `INSERT OR REPLACE INTO orders (id, latitude, longitude, subtotal, timestamp, zip_code, state,
+            tax_region, county_fips, state_rate, county_rate, city_rate, special_rate,
+            composite_tax_rate, tax_amount, total_amount, jurisdictions)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [csvId, lat, lon, parseFloat(row.subtotal), ts, tax.zip_code, tax.state, tax.tax_region,
+           tax.county_fips, tax.state_rate, tax.county_rate, tax.city_rate, tax.special_rate,
+           tax.composite_tax_rate, tax.tax_amount, tax.total_amount, JSON.stringify(tax.jurisdictions)]
+        );
+        success.push({ id: csvId, original_id: row.id });
+      }
+
+      processed++;
+      const importedId = result.status === "fulfilled" ? result.value.csvId : null;
+      send({ type: "progress", processed, id: importedId });
+    }
+  }
+
+  send({ type: "done", success: success.length, failed: failed.length, errors: failed.slice(0, 20) });
+  res.end();
+});
+
 // POST /orders/import — bulk import from CSV file, preserves original IDs
 router.post("/import", upload.single("file"), async (req: Request, res: Response) => {
   if (!req.file) { res.status(400).json({ error: "No file provided" }); return; }
@@ -147,6 +220,17 @@ router.post("/import", upload.single("file"), async (req: Request, res: Response
   }
 
   res.json({ success: success.length, failed: failed.length, errors: failed.slice(0, 20) });
+});
+
+// POST /orders/rollback — delete specific order IDs (used when import is cancelled)
+router.post("/rollback", (req: Request, res: Response) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    res.status(400).json({ error: "ids must be a non-empty array" }); return;
+  }
+  const placeholders = ids.map(() => "?").join(", ");
+  runQuery(`DELETE FROM orders WHERE id IN (${placeholders})`, ids);
+  res.json({ ok: true, deleted: ids.length });
 });
 
 // DELETE /orders — clear all orders from the database

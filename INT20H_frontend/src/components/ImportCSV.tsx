@@ -1,5 +1,5 @@
 import { useState, useRef } from "react";
-import { importOrders, ImportResult } from "../api";
+import { ImportResult } from "../api";
 
 interface Props {
   onSuccess: () => void;
@@ -8,44 +8,163 @@ interface Props {
 export default function ImportCSV({ onSuccess }: Props) {
   const [result, setResult] = useState<ImportResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [cancelled, setCancelled] = useState(false);
   const [error, setError] = useState("");
+  const [rowCount, setRowCount] = useState<number | null>(null);
+  const [processed, setProcessed] = useState(0);
   const fileRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  // Track IDs imported in this session so we can roll them back on cancel
+  const importedIdsRef = useRef<number[]>([]);
+
+  function handleFileChange() {
+    setResult(null); setError(""); setRowCount(null);
+    setProcessed(0); setCancelled(false);
+    const file = fileRef.current?.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result as string;
+      const lines = text.split("\n").filter((l) => l.trim().length > 0);
+      setRowCount(Math.max(0, lines.length - 1));
+    };
+    reader.readAsText(file);
+  }
+
+  async function handleCancel() {
+    // 1. Abort the SSE stream
+    abortRef.current?.abort();
+
+    // 2. Delete all rows that were already written to DB in this import
+    const ids = importedIdsRef.current;
+    if (ids.length > 0) {
+      const token = localStorage.getItem("token") || "";
+      await fetch("/api/orders/rollback", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ ids }),
+      });
+    }
+
+    importedIdsRef.current = [];
+    setCancelled(true);
+    setLoading(false);
+    setProcessed(0);
+    onSuccess(); // refresh table
+  }
 
   async function handleImport() {
     const file = fileRef.current?.files?.[0];
     if (!file) { setError("Please select a CSV file"); return; }
-    setError(""); setResult(null); setLoading(true);
+
+    setError(""); setResult(null); setProcessed(0);
+    setCancelled(false); setLoading(true);
+    importedIdsRef.current = [];
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     try {
-      const res = await importOrders(file);
-      setResult(res);
-      if (res.success > 0) onSuccess();
+      const token = localStorage.getItem("token") || "";
+      const form = new FormData();
+      form.append("file", file);
+
+      const res = await fetch("/api/orders/import/stream", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+        signal: controller.signal,
+      });
+
+      if (!res.ok || !res.body) throw new Error("Import failed");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const json = JSON.parse(line.slice(5).trim());
+
+          if (json.type === "progress") {
+            setProcessed(json.processed);
+            // Track every successfully imported ID for potential rollback
+            if (json.id != null) importedIdsRef.current.push(json.id);
+          } else if (json.type === "done") {
+            setResult({ success: json.success, failed: json.failed, errors: json.errors });
+            if (json.success > 0) onSuccess();
+          }
+        }
+      }
     } catch (e: any) {
-      setError(e.message);
+      if (e.name !== "AbortError") setError(e.message);
     } finally {
       setLoading(false);
     }
   }
 
+  const percent = rowCount ? Math.round((processed / rowCount) * 100) : 0;
+
   return (
     <div style={styles.card}>
       <h3 style={styles.title}>📂 Import CSV</h3>
       <p style={styles.hint}>Expected columns: <code>id, longitude, latitude, timestamp, subtotal</code></p>
+
       <div style={styles.row}>
-        <input ref={fileRef} type="file" accept=".csv" style={styles.fileInput} />
+        <input ref={fileRef} type="file" accept=".csv" style={styles.fileInput} onChange={handleFileChange} />
         <button onClick={handleImport} disabled={loading} style={styles.btn}>
           {loading ? "Importing..." : "Import"}
         </button>
+        {loading && (
+          <button onClick={handleCancel} style={styles.cancelBtn}>
+            ✕ Cancel
+          </button>
+        )}
       </div>
+
+      {loading && rowCount !== null && (
+        <div style={styles.progressWrap}>
+          <div style={styles.progressTrack}>
+            <div style={{ ...styles.progressFill, width: `${percent}%` }} />
+          </div>
+          <p style={styles.progressText}>
+            ⏳ {processed} / {rowCount} rows processed ({percent}%)
+          </p>
+          <p style={styles.progressHint}>
+            Each row requires a geocoding request via Census API
+          </p>
+        </div>
+      )}
+
+      {cancelled && (
+        <div style={styles.cancelledBanner}>
+          ⚠️ Import cancelled — {processed} rows were removed from the database.
+        </div>
+      )}
+
       {error && <p style={{ color: "red", marginTop: 8 }}>{error}</p>}
-      {result && (
+
+      {result && !cancelled && (
         <div style={styles.result}>
-          <span style={{ color: "#16a34a" }}>✅ {result.success} imported</span>
-          {result.failed > 0 && <span style={{ color: "red", marginLeft: 16 }}>❌ {result.failed} failed</span>}
+          <div style={styles.resultRow}>
+            <span style={styles.successBadge}>✅ {result.success} imported</span>
+            {result.failed > 0 && <span style={styles.failBadge}>❌ {result.failed} failed</span>}
+            {rowCount !== null && <span style={styles.totalBadge}>{result.success} / {rowCount} rows</span>}
+          </div>
           {result.errors.length > 0 && (
-            <ul style={{ marginTop: 8, fontSize: 13, color: "#666" }}>
-              {result.errors.map((e, i) => (
-                <li key={i}>Row {e.original_id}: {e.error}</li>
-              ))}
+            <ul style={styles.errorList}>
+              {result.errors.map((e, i) => <li key={i}>Row {e.original_id}: {e.error}</li>)}
             </ul>
           )}
         </div>
@@ -61,5 +180,17 @@ const styles: Record<string, React.CSSProperties> = {
   row: { display: "flex", gap: 12, alignItems: "center" },
   fileInput: { flex: 1, padding: "8px", border: "1px solid #ddd", borderRadius: 8 },
   btn: { padding: "10px 20px", background: "#4f46e5", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", whiteSpace: "nowrap" },
+  cancelBtn: { padding: "10px 16px", background: "#fee2e2", color: "#dc2626", border: "1px solid #fca5a5", borderRadius: 8, cursor: "pointer", whiteSpace: "nowrap", fontWeight: 500 },
+  progressWrap: { marginTop: 16 },
+  progressTrack: { height: 8, background: "#e5e7eb", borderRadius: 99, overflow: "hidden", marginBottom: 8 },
+  progressFill: { height: "100%", background: "linear-gradient(90deg, #4f46e5, #818cf8)", borderRadius: 99, transition: "width 0.3s ease" },
+  progressText: { margin: "0 0 4px", fontSize: 14, color: "#374151", fontWeight: 500 },
+  progressHint: { margin: 0, fontSize: 12, color: "#9ca3af" },
+  cancelledBanner: { marginTop: 12, padding: "10px 14px", background: "#fef9c3", border: "1px solid #fde68a", borderRadius: 8, fontSize: 14, color: "#92400e" },
   result: { marginTop: 12, padding: 12, background: "#f9fafb", borderRadius: 8 },
+  resultRow: { display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" },
+  successBadge: { color: "#16a34a", fontWeight: 500 },
+  failBadge: { color: "#dc2626", fontWeight: 500 },
+  totalBadge: { color: "#6b7280", fontSize: 13 },
+  errorList: { marginTop: 8, fontSize: 13, color: "#666", paddingLeft: 16 },
 };
